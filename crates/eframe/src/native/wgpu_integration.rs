@@ -5,7 +5,13 @@
 //! There is a bunch of improvements we could do,
 //! like removing a bunch of `unwraps`.
 
-use std::{cell::RefCell, num::NonZeroU32, rc::Rc, sync::Arc, time::Instant};
+use std::{
+    cell::RefCell,
+    num::NonZeroU32,
+    rc::Rc,
+    sync::{mpsc::Sender, Arc},
+    time::Instant,
+};
 
 use egui_winit::ActionRequested;
 use parking_lot::Mutex;
@@ -35,7 +41,7 @@ use super::{winit_integration::WinitApp, *};
 // Types:
 
 pub struct WgpuWinitApp {
-    repaint_proxy: Arc<Mutex<EventLoopProxy<UserEvent>>>,
+    repaint_proxy: Arc<Mutex<EventLoopProxy>>,
     app_name: String,
     native_options: NativeOptions,
 
@@ -44,6 +50,7 @@ pub struct WgpuWinitApp {
 
     /// Set when we are actually up and running.
     running: Option<WgpuWinitRunning>,
+    tx: Sender<UserEvent>,
 }
 
 /// State that is initialized when the application is first starts running via
@@ -97,10 +104,11 @@ pub struct Viewport {
 
 impl WgpuWinitApp {
     pub fn new(
-        event_loop: &EventLoop<UserEvent>,
+        event_loop: &EventLoop,
         app_name: &str,
         native_options: NativeOptions,
         app_creator: AppCreator,
+        tx: Sender<UserEvent>,
     ) -> Self {
         crate::profile_function!();
 
@@ -116,6 +124,7 @@ impl WgpuWinitApp {
             native_options,
             running: None,
             app_creator: Some(app_creator),
+            tx,
         }
     }
 
@@ -221,19 +230,18 @@ impl WgpuWinitApp {
         {
             let event_loop_proxy = self.repaint_proxy.clone();
 
+            let tx = self.tx.clone();
             egui_ctx.set_request_repaint_callback(move |info| {
                 log::trace!("request_repaint_callback: {info:?}");
                 let when = Instant::now() + info.delay;
                 let frame_nr = info.current_frame_nr;
-
-                event_loop_proxy
-                    .lock()
-                    .send_event(UserEvent::RequestRepaint {
-                        when,
-                        frame_nr,
-                        viewport_id: info.viewport_id,
-                    })
-                    .ok();
+                tx.send(UserEvent::RequestRepaint {
+                    when,
+                    frame_nr,
+                    viewport_id: info.viewport_id,
+                })
+                .ok();
+                event_loop_proxy.lock().wake_up();
             });
         }
 

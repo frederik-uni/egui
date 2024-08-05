@@ -1,4 +1,8 @@
-use std::{cell::RefCell, time::Instant};
+use std::{
+    cell::RefCell,
+    sync::mpsc::{self, Receiver, Sender},
+    time::Instant,
+};
 
 use winit::{
     application::ApplicationHandler,
@@ -16,9 +20,9 @@ use crate::{
 };
 
 // ----------------------------------------------------------------------------
-fn create_event_loop(native_options: &mut epi::NativeOptions) -> Result<EventLoop<UserEvent>> {
+fn create_event_loop(native_options: &mut epi::NativeOptions) -> Result<EventLoop> {
     crate::profile_function!();
-    let mut builder = winit::event_loop::EventLoop::with_user_event();
+    let mut builder = winit::event_loop::EventLoop::builder();
 
     if let Some(hook) = std::mem::take(&mut native_options.event_loop_builder) {
         hook(&mut builder);
@@ -34,9 +38,9 @@ fn create_event_loop(native_options: &mut epi::NativeOptions) -> Result<EventLoo
 /// multiple times. This is just a limitation of winit.
 fn with_event_loop<R>(
     mut native_options: epi::NativeOptions,
-    f: impl FnOnce(&mut EventLoop<UserEvent>, epi::NativeOptions) -> R,
+    f: impl FnOnce(&mut EventLoop, epi::NativeOptions) -> R,
 ) -> Result<R> {
-    thread_local!(static EVENT_LOOP: RefCell<Option<EventLoop<UserEvent>>> = RefCell::new(None));
+    thread_local!(static EVENT_LOOP: RefCell<Option<EventLoop>> = RefCell::new(None));
 
     EVENT_LOOP.with(|event_loop| {
         // Since we want to reference NativeOptions when creating the EventLoop we can't
@@ -59,15 +63,17 @@ struct WinitAppWrapper<T: WinitApp> {
     winit_app: T,
     return_result: Result<(), crate::Error>,
     run_and_return: bool,
+    receiver: Receiver<UserEvent>,
 }
 
 impl<T: WinitApp> WinitAppWrapper<T> {
-    fn new(winit_app: T, run_and_return: bool) -> Self {
+    fn new(winit_app: T, run_and_return: bool, receiver: Receiver<UserEvent>) -> Self {
         Self {
             windows_next_repaint_times: HashMap::default(),
             winit_app,
             return_result: Ok(()),
             run_and_return,
+            receiver,
         }
     }
 
@@ -176,10 +182,10 @@ impl<T: WinitApp> WinitAppWrapper<T> {
         if let Some(next_repaint_time) = next_repaint_time {
             // WaitUntil seems to not work on iOS
             #[cfg(target_os = "ios")]
-            winit_app
+            self.winit_app
                 .window_id_from_viewport_id(egui::ViewportId::ROOT)
                 .map(|window_id| {
-                    winit_app
+                    self.winit_app
                         .window(window_id)
                         .map(|window| window.request_redraw())
                 });
@@ -189,7 +195,7 @@ impl<T: WinitApp> WinitAppWrapper<T> {
     }
 }
 
-impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
+impl<T: WinitApp> ApplicationHandler for WinitAppWrapper<T> {
     fn suspended(&mut self, event_loop: &ActiveEventLoop) {
         crate::profile_function!("Event::Suspended");
 
@@ -233,44 +239,6 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
         });
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
-        crate::profile_function!(match &event {
-            UserEvent::RequestRepaint { .. } => "UserEvent::RequestRepaint",
-            #[cfg(feature = "accesskit")]
-            UserEvent::AccessKitActionRequest(_) => "UserEvent::AccessKitActionRequest",
-        });
-
-        event_loop_context::with_event_loop_context(event_loop, move || {
-            let event_result = match event {
-                UserEvent::RequestRepaint {
-                    when,
-                    frame_nr,
-                    viewport_id,
-                } => {
-                    let current_frame_nr = self.winit_app.frame_nr(viewport_id);
-                    if current_frame_nr == frame_nr || current_frame_nr == frame_nr + 1 {
-                        log::trace!("UserEvent::RequestRepaint scheduling repaint at {when:?}");
-                        if let Some(window_id) =
-                            self.winit_app.window_id_from_viewport_id(viewport_id)
-                        {
-                            Ok(EventResult::RepaintAt(window_id, when))
-                        } else {
-                            Ok(EventResult::Wait)
-                        }
-                    } else {
-                        log::trace!("Got outdated UserEvent::RequestRepaint");
-                        Ok(EventResult::Wait) // old request - we've already repainted
-                    }
-                }
-                #[cfg(feature = "accesskit")]
-                UserEvent::AccessKitActionRequest(request) => {
-                    self.winit_app.on_accesskit_event(request)
-                }
-            };
-            self.handle_event_result(event_loop, event_result);
-        });
-    }
-
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
         if let winit::event::StartCause::ResumeTimeReached { .. } = cause {
             log::trace!("Woke up to check next_repaint_time");
@@ -300,25 +268,79 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
             self.handle_event_result(event_loop, event_result);
         });
     }
+
+    fn proxy_wake_up(&mut self, event_loop: &ActiveEventLoop) {
+        if let Ok(event) = self.receiver.recv() {
+            user_wake_up(event_loop, event, self)
+        }
+    }
+
+    fn can_create_surfaces(&mut self, _: &ActiveEventLoop) {}
+}
+
+fn user_wake_up<T: WinitApp>(
+    event_loop: &ActiveEventLoop,
+    event: UserEvent,
+    sel: &mut WinitAppWrapper<T>,
+) {
+    crate::profile_function!(match &event {
+        UserEvent::RequestRepaint { .. } => "UserEvent::RequestRepaint",
+        #[cfg(feature = "accesskit")]
+        UserEvent::AccessKitActionRequest(_) => "UserEvent::AccessKitActionRequest",
+    });
+
+    event_loop_context::with_event_loop_context(event_loop, move || {
+        let event_result = match event {
+            UserEvent::RequestRepaint {
+                when,
+                frame_nr,
+                viewport_id,
+            } => {
+                let current_frame_nr = sel.winit_app.frame_nr(viewport_id);
+                if current_frame_nr == frame_nr || current_frame_nr == frame_nr + 1 {
+                    log::trace!("UserEvent::RequestRepaint scheduling repaint at {when:?}");
+                    if let Some(window_id) = sel.winit_app.window_id_from_viewport_id(viewport_id) {
+                        Ok(EventResult::RepaintAt(window_id, when))
+                    } else {
+                        Ok(EventResult::Wait)
+                    }
+                } else {
+                    log::trace!("Got outdated UserEvent::RequestRepaint");
+                    Ok(EventResult::Wait) // old request - we've already repainted
+                }
+            }
+            #[cfg(feature = "accesskit")]
+            UserEvent::AccessKitActionRequest(request) => {
+                self.winit_app.on_accesskit_event(request)
+            }
+        };
+        sel.handle_event_result(event_loop, event_result);
+    });
 }
 
 #[cfg(not(target_os = "ios"))]
-fn run_and_return(event_loop: &mut EventLoop<UserEvent>, winit_app: impl WinitApp) -> Result {
+fn run_and_return(
+    event_loop: &mut EventLoop,
+    winit_app: impl WinitApp,
+    rx: Receiver<UserEvent>,
+) -> Result {
     use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
 
     log::trace!("Entering the winit event loop (run_app_on_demand)…");
-
-    let mut app = WinitAppWrapper::new(winit_app, true);
+    let mut app = WinitAppWrapper::new(winit_app, true, rx);
     event_loop.run_app_on_demand(&mut app)?;
     log::debug!("eframe window closed");
     app.return_result
 }
 
-fn run_and_exit(event_loop: EventLoop<UserEvent>, winit_app: impl WinitApp + 'static) -> Result {
+fn run_and_exit(
+    event_loop: EventLoop,
+    winit_app: impl WinitApp + 'static,
+    rx: Receiver<UserEvent>,
+) -> Result {
     log::trace!("Entering the winit event loop (run_app)…");
-
     // When to repaint what window
-    let mut app = WinitAppWrapper::new(winit_app, false);
+    let mut app = WinitAppWrapper::new(winit_app, false, rx);
     event_loop.run_app(&mut app)?;
 
     log::debug!("winit event loop unexpectedly returned");
@@ -361,16 +383,18 @@ pub fn run_wgpu(
     #![allow(clippy::needless_return_with_question_mark)] // False positive
 
     use super::wgpu_integration::WgpuWinitApp;
+    let (tx, rx): (Sender<UserEvent>, Receiver<UserEvent>) = mpsc::channel();
 
     #[cfg(not(target_os = "ios"))]
     if native_options.run_and_return {
         return with_event_loop(native_options, |event_loop, native_options| {
-            let wgpu_eframe = WgpuWinitApp::new(event_loop, app_name, native_options, app_creator);
-            run_and_return(event_loop, wgpu_eframe)
+            let wgpu_eframe =
+                WgpuWinitApp::new(event_loop, app_name, native_options, app_creator, tx);
+            run_and_return(event_loop, wgpu_eframe, rx)
         })?;
     }
 
     let event_loop = create_event_loop(&mut native_options)?;
-    let wgpu_eframe = WgpuWinitApp::new(&event_loop, app_name, native_options, app_creator);
-    run_and_exit(event_loop, wgpu_eframe)
+    let wgpu_eframe = WgpuWinitApp::new(&event_loop, app_name, native_options, app_creator, tx);
+    run_and_exit(event_loop, wgpu_eframe, rx)
 }

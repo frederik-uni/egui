@@ -174,6 +174,9 @@ pub use web::{WebLogger, WebRunner};
 #[cfg(any(feature = "glow", feature = "wgpu"))]
 mod native;
 
+#[cfg(target_os = "ios")]
+pub use native::ios_safe_area;
+
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(any(feature = "glow", feature = "wgpu"))]
 #[cfg(feature = "persistence")]

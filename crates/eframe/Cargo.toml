@@ -166,6 +166,10 @@ wgpu = { workspace = true, optional = true, features = [
   "webgpu",
 ] }
 
+#ios
+[target.'cfg(any(target_os = "ios"))'.dependencies]
+objc = "0.2"
+
 # mac:
 [target.'cfg(any(target_os = "macos"))'.dependencies]
 objc2 = "0.5.1"

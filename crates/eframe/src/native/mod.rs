@@ -12,5 +12,7 @@ pub(crate) mod winit_integration;
 #[cfg(feature = "glow")]
 mod glow_integration;
 
+#[cfg(target_os = "ios")]
+pub mod ios_safe_area;
 #[cfg(feature = "wgpu")]
 mod wgpu_integration;
